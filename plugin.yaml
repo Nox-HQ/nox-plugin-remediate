@@ -1,0 +1,11 @@
+name: nox-plugin-remediate
+version: 0.1.0
+track: remediation
+description: Deterministic remediation planning and application for code findings
+tools:
+  - name: plan_code
+    description: Plan deterministic code remediations for supported rules
+  - name: apply_code
+    description: Apply deterministic code remediations from a prepared plan
+  - name: verify_code
+    description: Verify remediation changes and emit pass/fail diagnostics
