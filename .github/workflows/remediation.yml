@@ -25,7 +25,7 @@ jobs:
       - name: Strip local replace directives
         run: sed -i '/^replace /d' go.mod && go mod tidy
 
-      - uses: nox-hq/nox-remediate-action@v1
+      - uses: nox-hq/nox-remediate-action@1c16a4bb803d73ca96a17760f847c9ad80e162cd # v1
         with:
           path: .
           manifest-root: .
