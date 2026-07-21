@@ -3,6 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -544,72 +547,199 @@ func isSensitiveVar(name string) bool {
 	return false
 }
 
-// applyGoSecretRewrite replaces hardcoded secret strings with os.Getenv("NAME").
+// applyGoSecretRewrite replaces a hardcoded secret string assigned to a
+// sensitively-named identifier with an os.Getenv("NAME") lookup.
+//
+// It is AST-aware on purpose. A line-based approach cannot tell a real
+// string-literal assignment from a line that merely contains "=" and a quote
+// (e.g. an `if token == "x"` guard), and it silently drops trailing comments
+// and forgets to add the "os" import — emitting code that does not compile.
+// For a security fixer, broken or lossy output is worse than doing nothing:
+// the whole reason SEC-003 also warns to rotate the credential is that the
+// code change was never the important half. So the contract here is
+// safety over coverage — whenever we cannot perform the rewrite correctly and
+// without losing surrounding meaning, we skip it and return (src, false),
+// leaving the finding to be reported.
 func applyGoSecretRewrite(src string) (string, bool) {
-	changed := false
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		// Source does not parse as Go; we cannot reason about it safely.
+		return src, false
+	}
+
+	// A single string-literal assignment to a sensitive identifier that we can
+	// rewrite. Positions are 1-based; we only ever record single-line literals.
+	type rewrite struct {
+		line    int // line of the string literal (== statement line)
+		colFrom int // byte column where the literal starts
+		colTo   int // byte column just past the literal
+		envName string
+	}
+	var rewrites []rewrite
+
+	consider := func(name *ast.Ident, value ast.Expr) {
+		if name == nil {
+			return
+		}
+		lit, ok := value.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return
+		}
+		if !isSensitiveVar(name.Name) {
+			return
+		}
+		start := fset.Position(lit.Pos())
+		end := fset.Position(lit.End())
+		if start.Line != end.Line {
+			// Multi-line (raw) string literal: rewriting while preserving
+			// layout and trailing content is error-prone, so skip.
+			return
+		}
+		rewrites = append(rewrites, rewrite{
+			line:    start.Line,
+			colFrom: start.Column,
+			colTo:   end.Column,
+			envName: toEnvName(name.Name),
+		})
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			// x := "..." or x = "...", exactly one identifier and one value.
+			// A comparison such as `if token == "x"` is a BinaryExpr, not an
+			// AssignStmt, so it is correctly left untouched.
+			if len(node.Lhs) == 1 && len(node.Rhs) == 1 {
+				if ident, ok := node.Lhs[0].(*ast.Ident); ok {
+					consider(ident, node.Rhs[0])
+				}
+			}
+		case *ast.ValueSpec:
+			// var/const x = "...", single name and value.
+			if len(node.Names) == 1 && len(node.Values) == 1 {
+				consider(node.Names[0], node.Values[0])
+			}
+		}
+		return true
+	})
+
+	if len(rewrites) == 0 {
+		return src, false
+	}
+
+	// Index by line. If two sensitive assignments share a line (joined with a
+	// semicolon), skip that line rather than risk a lossy overlapping edit.
+	byLine := make(map[int][]rewrite)
+	for _, r := range rewrites {
+		byLine[r.line] = append(byLine[r.line], r)
+	}
+
 	lines := strings.Split(src, "\n")
-	out := make([]string, 0, len(lines))
+	changed := false
+	out := make([]string, 0, len(lines)+2*len(rewrites))
 
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// Must have = and a string literal
-		if !strings.Contains(trimmed, "=") || !strings.Contains(trimmed, `"`) {
+	for i, line := range lines {
+		rs := byLine[i+1]
+		if len(rs) != 1 {
 			out = append(out, line)
 			continue
 		}
-		// Skip if already using os.Getenv or has SEC-003 comment
-		if strings.Contains(trimmed, "os.Getenv(") || strings.Contains(trimmed, "// SEC-003") {
+		r := rs[0]
+		// Guard the recorded span against any surprise before slicing.
+		if r.colFrom < 1 || r.colTo-1 > len(line) || r.colFrom >= r.colTo {
 			out = append(out, line)
 			continue
 		}
-
-		// Find = position
-		idx := strings.Index(trimmed, "=")
-		if idx < 0 {
-			out = append(out, line)
-			continue
-		}
-
-		// Extract variable name (before =)
-		varName := strings.TrimSpace(trimmed[:idx])
-		// Strip := or = (assignment operators) from right side
-		varName = strings.TrimRight(varName, ":=")
-		// Strip var/const/let prefixes
-		for _, kw := range []string{"var ", "const "} {
-			varName = strings.TrimPrefix(varName, kw)
-		}
-		varName = strings.TrimSpace(varName)
-
-		// Check if sensitive variable
-		if !isSensitiveVar(varName) {
-		out = append(out, line)
-		continue
-	}
-
-		// Get the right side (after =)
-		rhs := strings.TrimSpace(trimmed[idx+1:])
-		// Must have a string literal on right side
-		if !strings.HasPrefix(rhs, `"`) {
+		literal := line[r.colFrom-1 : r.colTo-1]
+		if len(literal) < 2 || (literal[0] != '"' && literal[0] != '`') {
 			out = append(out, line)
 			continue
 		}
 
-		// Build replacement
 		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-		envName := toEnvName(varName)
-		origPrefix := strings.TrimSpace(trimmed[:idx+1])
-
-		changed = true
-		out = append(out, fmt.Sprintf(`%s%s os.Getenv("%s")`, indent, origPrefix, envName))
+		before := line[:r.colFrom-1] // keeps indent and `name := `
+		after := line[r.colTo-1:]    // keeps any trailing comment / content
+		out = append(out, fmt.Sprintf(`%sos.Getenv("%s")%s`, before, r.envName, after))
 		out = append(out, fmt.Sprintf(`%s// %s`, indent, secretRotationNotice))
-		out = append(out, fmt.Sprintf(`%s// TODO: Set %s env var via deployment config. (SEC-003)`, indent, envName))
-		continue
+		out = append(out, fmt.Sprintf(`%s// TODO: Set %s env var via deployment config. (SEC-003)`, indent, r.envName))
+		changed = true
 	}
+
 	if !changed {
 		return src, false
 	}
-	return strings.Join(out, "\n"), true
+
+	result := strings.Join(out, "\n")
+
+	// We now call os.Getenv, so "os" must be imported.
+	if !goFileImports(file, "os") {
+		withImport, ierr := addGoImport(result, "os")
+		if ierr != nil {
+			// Cannot add the import cleanly; do not emit non-compiling code.
+			return src, false
+		}
+		result = withImport
+	}
+
+	// Final safety net: never hand back Go that does not parse.
+	if _, perr := parser.ParseFile(token.NewFileSet(), "", result, parser.ParseComments); perr != nil {
+		return src, false
+	}
+
+	return result, true
+}
+
+// goFileImports reports whether file already imports the given package path.
+func goFileImports(file *ast.File, path string) bool {
+	want := `"` + path + `"`
+	for _, imp := range file.Imports {
+		if imp.Path != nil && imp.Path.Value == want {
+			return true
+		}
+	}
+	return false
+}
+
+// addGoImport inserts an import of path into src's import section, preferring an
+// existing parenthesized import block, then an existing single import, and
+// finally a fresh declaration after the package clause. Returns an error only
+// if src no longer parses as Go.
+func addGoImport(src, path string) (string, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(src, "\n")
+	quoted := `"` + path + `"`
+
+	insertAfter := func(idx int, newLines ...string) string {
+		merged := make([]string, 0, len(lines)+len(newLines))
+		merged = append(merged, lines[:idx]...)
+		merged = append(merged, newLines...)
+		merged = append(merged, lines[idx:]...)
+		return strings.Join(merged, "\n")
+	}
+
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.IMPORT {
+			continue
+		}
+		if gd.Lparen.IsValid() {
+			// import ( ... ) — insert right after the opening paren line.
+			openLine := fset.Position(gd.Lparen).Line
+			return insertAfter(openLine, "\t"+quoted), nil
+		}
+		// import "x" — add a standalone declaration on the next line.
+		importLine := fset.Position(gd.End()).Line
+		return insertAfter(importLine, "import "+quoted), nil
+	}
+
+	// No import declaration at all — add one after the package clause.
+	pkgLine := fset.Position(file.Name.End()).Line
+	return insertAfter(pkgLine, "", "import "+quoted), nil
 }
 
 // applyPythonSecretRewrite replaces hardcoded secret strings with os.environ.get("NAME").
