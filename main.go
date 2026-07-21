@@ -64,6 +64,7 @@ func handlePlanCode(engine *PatchEngine) sdk.ToolHandler {
 		for _, p := range plan.Patches {
 			resp.Diagnostic(pluginv1.DiagnosticSeverity_DIAGNOSTIC_SEVERITY_INFO, fmt.Sprintf("planned patch: %s (%d + / %d -)", p.FilePath, p.AddedLines, p.RemovedLines), "nox/remediate")
 		}
+		emitRemediationNotes(resp, plan)
 		return resp.Build(), nil
 	}
 }
@@ -92,6 +93,11 @@ func handleApplyCode(engine *PatchEngine, guardrails Guardrails) sdk.ToolHandler
 			return nil, fmt.Errorf("%w: %q", ErrInvalidVerificationCmd, verifyCmd)
 		}
 		autoVerify, _ := req.Input["verify"].(bool)
+
+		// Emitted before apply so the advisory reaches the caller on both the
+		// verified and unverified paths. Some fixes are not complete once the
+		// code changes; SEC-003 needs credential rotation out of band.
+		emitRemediationNotes(resp, plan)
 
 		if !autoVerify {
 			result, err := engine.Apply(plan)
@@ -142,6 +148,14 @@ func handleVerifyCode(engine *PatchEngine) sdk.ToolHandler {
 			resp.Diagnostic(sev, msg, "nox/remediate")
 		}
 		return resp.Build(), nil
+	}
+}
+
+// emitRemediationNotes surfaces rule-level advisories as warnings so they land
+// in the tool result, not only inside the patch diff a reviewer may skim past.
+func emitRemediationNotes(resp *sdk.ResponseBuilder, plan PatchPlan) {
+	for _, note := range plan.RemediationNotes() {
+		resp.Diagnostic(pluginv1.DiagnosticSeverity_DIAGNOSTIC_SEVERITY_WARNING, note, "nox/remediate")
 	}
 }
 

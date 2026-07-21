@@ -460,6 +460,36 @@ func applyJSAILogRedaction(src string) (string, bool) {
 	return strings.Join(out, "\n"), true
 }
 
+// secretRotationNotice is emitted next to every SEC-003 rewrite. Moving a
+// hardcoded credential into an env var lookup silences the finding but does not
+// undo the exposure: the literal is still in git history and must be treated as
+// leaked. Rotation at the provider is the only action that ends the exposure.
+const secretRotationNotice = "SECURITY: the previous hardcoded value is compromised (still in git history) - rotate/revoke it at the provider. (SEC-003)"
+
+// ruleRemediationNotes carries rule-level advisories that must reach a human
+// reviewer, not just the code diff. A comment inside a patch is easy to miss in
+// review; these are surfaced as diagnostics on plan/apply as well.
+var ruleRemediationNotes = map[string]string{
+	"SEC-003": "SEC-003: hardcoded credentials were rewritten to environment lookups, but the original values remain in git history and must be treated as leaked. Rotate/revoke every affected credential at its provider - a green scan does not mean the secret is safe.",
+}
+
+// RemediationNotes returns the deduplicated rule-level advisories for the rules
+// covered by this plan, in first-seen patch order for deterministic output.
+func (p PatchPlan) RemediationNotes() []string {
+	var notes []string
+	seen := make(map[string]bool, len(p.Patches))
+	for _, patch := range p.Patches {
+		if seen[patch.RuleID] {
+			continue
+		}
+		seen[patch.RuleID] = true
+		if note, ok := ruleRemediationNotes[patch.RuleID]; ok {
+			notes = append(notes, note)
+		}
+	}
+	return notes
+}
+
 var sensitiveVarPatterns = []string{
 	"password",
 	"secret",
@@ -572,6 +602,7 @@ func applyGoSecretRewrite(src string) (string, bool) {
 
 		changed = true
 		out = append(out, fmt.Sprintf(`%s%s os.Getenv("%s")`, indent, origPrefix, envName))
+		out = append(out, fmt.Sprintf(`%s// %s`, indent, secretRotationNotice))
 		out = append(out, fmt.Sprintf(`%s// TODO: Set %s env var via deployment config. (SEC-003)`, indent, envName))
 		continue
 	}
@@ -616,6 +647,7 @@ func applyPythonSecretRewrite(src string) (string, bool) {
 		envName := toEnvName(varName)
 		changed = true
 		out = append(out, fmt.Sprintf(`%s%s os.environ.get("%s")`, indent, strings.TrimSpace(trimmed[:idx+1]), envName))
+		out = append(out, fmt.Sprintf(`%s# %s`, indent, secretRotationNotice))
 		out = append(out, fmt.Sprintf(`%s# TODO: Set %s env var via deployment config. (SEC-003)`, indent, envName))
 		continue
 	}
@@ -667,6 +699,7 @@ func applyJSSecretRewrite(src string) (string, bool) {
 		origPrefix := strings.TrimSpace(trimmed[:idx+1])
 		changed = true
 		out = append(out, fmt.Sprintf(`%s%s process.env.%s`, indent, origPrefix, envName))
+		out = append(out, fmt.Sprintf(`%s// %s`, indent, secretRotationNotice))
 		out = append(out, fmt.Sprintf(`%s// TODO: Set %s env var via deployment config. (SEC-003)`, indent, envName))
 		continue
 	}
