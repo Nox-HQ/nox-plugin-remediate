@@ -860,3 +860,123 @@ func TestApplyAndVerifyKeepsChangesOnSuccess(t *testing.T) {
 		t.Fatalf("expected SEC-003 rewrite to persist; got:\n%s", string(got))
 	}
 }
+
+// TestSEC003EmitsRotationGuidance asserts every SEC-003 fixer tells the reader
+// the previously hardcoded value is compromised and must be rotated at its
+// provider. Rewriting to an env var only hides the literal; the original value
+// is still in git history, so without rotation the credential stays exposed
+// while the finding disappears.
+func TestSEC003EmitsRotationGuidance(t *testing.T) {
+	tests := []struct {
+		name    string
+		file    string
+		before  string
+		comment string
+	}{
+		{
+			name:    "go",
+			file:    "config.go",
+			before:  "package main\n\nfunc init() {\n    apiKey := \"sk-live-abc123\"\n}\n",
+			comment: "// ",
+		},
+		{
+			name:    "python",
+			file:    "config.py",
+			before:  "import os\n\ndef setup():\n    api_key = \"sk-live-abc123\"\n",
+			comment: "# ",
+		},
+		{
+			name:    "js",
+			file:    "config.js",
+			before:  "const apiKey = \"sk-live-abc123\"\n",
+			comment: "// ",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, tt.file)
+			if err := os.WriteFile(path, []byte(tt.before), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+
+			e := NewPatchEngine()
+			plan, err := e.Plan(sdk.ToolRequest{WorkspaceRoot: dir})
+			if err != nil {
+				t.Fatalf("Plan() error = %v", err)
+			}
+			if len(plan.Patches) == 0 {
+				t.Fatal("expected at least 1 SEC-003 patch")
+			}
+			if _, err := e.Apply(plan); err != nil {
+				t.Fatalf("Apply() error = %v", err)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("ReadFile() error = %v", err)
+			}
+			after := string(raw)
+
+			if !strings.Contains(after, tt.comment+secretRotationNotice) {
+				t.Fatalf("expected rotation notice as a %q comment; got:\n%s", strings.TrimSpace(tt.comment), after)
+			}
+			for _, want := range []string{"compromised", "rotate/revoke"} {
+				if !strings.Contains(strings.ToLower(after), want) {
+					t.Fatalf("expected guidance to mention %q; got:\n%s", want, after)
+				}
+			}
+		})
+	}
+}
+
+// TestSEC003RotationGuidanceIsIdempotent guards against the added notice
+// causing a second planning pass to re-fire the fixer.
+func TestSEC003RotationGuidanceIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.go")
+	before := "package main\n\nfunc init() {\n    apiKey := \"sk-live-abc123\"\n}\n"
+	if err := os.WriteFile(path, []byte(before), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	e := NewPatchEngine()
+	plan, err := e.Plan(sdk.ToolRequest{WorkspaceRoot: dir})
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	if _, err := e.Apply(plan); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	plan2, err := e.Plan(sdk.ToolRequest{WorkspaceRoot: dir})
+	if err != nil {
+		t.Fatalf("Plan() second pass error = %v", err)
+	}
+	if len(plan2.Patches) != 0 {
+		t.Fatalf("Plan() second pass patches = %d, want 0", len(plan2.Patches))
+	}
+}
+
+// TestPatchPlanRemediationNotes checks the advisory is reachable outside the
+// code diff, so a PR reviewer sees it in the tool result too.
+func TestPatchPlanRemediationNotes(t *testing.T) {
+	plan := PatchPlan{Patches: []Patch{
+		{FilePath: "a.go", RuleID: "SEC-003"},
+		{FilePath: "b.js", RuleID: "SEC-003"},
+		{FilePath: "c.go", RuleID: "WEB-SEC-001"},
+	}}
+
+	notes := plan.RemediationNotes()
+	if len(notes) != 1 {
+		t.Fatalf("RemediationNotes() = %d note(s), want 1 (deduplicated by rule); got %v", len(notes), notes)
+	}
+	for _, want := range []string{"SEC-003", "git history", "Rotate/revoke"} {
+		if !strings.Contains(notes[0], want) {
+			t.Fatalf("expected note to mention %q; got %q", want, notes[0])
+		}
+	}
+
+	if got := (PatchPlan{Patches: []Patch{{FilePath: "c.go", RuleID: "WEB-SEC-001"}}}).RemediationNotes(); len(got) != 0 {
+		t.Fatalf("RemediationNotes() for unannotated rule = %v, want none", got)
+	}
+}
