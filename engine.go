@@ -612,44 +612,159 @@ func applyGoSecretRewrite(src string) (string, bool) {
 	return strings.Join(out, "\n"), true
 }
 
-// applyPythonSecretRewrite replaces hardcoded secret strings with os.environ.get("NAME").
+// applyPythonSecretRewrite replaces a hardcoded secret string literal assigned to
+// a sensitive-named identifier with os.getenv("NAME").
+//
+// Go's stdlib has no Python parser and this fixer must not pull in a heavyweight
+// one, so instead of a full parse we do a robust, self-contained scan of a single
+// syntactic shape: `name = <string literal> [# comment]`. The scan understands
+// single, double and triple quotes plus backslash escapes, and is deliberately
+// conservative: anything it cannot rewrite losslessly and correctly is SKIPPED
+// (the line is passed through untouched and the finding is left to be reported).
+// A secrets fixer that emits broken or lossy Python is worse than one that does
+// nothing.
+//
+// Deliberately SKIPPED (returned as-is): f-strings and any prefixed literal
+// (f/r/b/u), since rewriting them changes evaluation or type; concatenations
+// ("a" + b) and any trailing tokens after the literal; multi-target assignments
+// (a = b = "..."); augmented assignments (+=); comparisons (==); subscript
+// targets (d["k"] = ...); unterminated / multi-line strings; and lines already
+// using os.getenv (which structurally fail the "RHS starts with a quote" test).
+//
+// import os: we do NOT inject `import os`. Reliable text-level placement is not
+// possible without a parser — the correct spot sits after a module docstring,
+// __future__ imports and existing import blocks, and a naive insertion can land
+// inside a docstring or before `from __future__`, corrupting the file. Config
+// files that hold secrets almost always already import os, and a missing import
+// surfaces as a loud NameError at import time rather than silent breakage. We
+// rely on the emitted TODO/rotation notices instead; adding the import is left
+// to the human reviewer they direct.
 func applyPythonSecretRewrite(src string) (string, bool) {
+	// parseAssignment recognises a safe `name = "literal" [# comment]` line.
+	// On success it returns the assignment target, the trailing comment (empty
+	// if none, otherwise starting at '#'), and true. Otherwise it returns false
+	// and the caller passes the line through unchanged.
+	parseAssignment := func(line string) (varName string, comment string, ok bool) {
+		content := strings.TrimLeft(line, " \t")
+		if content == "" {
+			return "", "", false
+		}
+
+		// Assignment target: a (possibly dotted) identifier, e.g. `password`
+		// or `self.api_key`. Must start with a letter or underscore.
+		isIdentStart := func(c byte) bool {
+			return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		}
+		isIdentPart := func(c byte) bool {
+			return isIdentStart(c) || c == '.' || (c >= '0' && c <= '9')
+		}
+		if !isIdentStart(content[0]) {
+			return "", "", false
+		}
+		i := 0
+		for i < len(content) && isIdentPart(content[i]) {
+			i++
+		}
+		name := content[:i]
+		if !isSensitiveVar(name) {
+			return "", "", false
+		}
+
+		// Require exactly one '=' (skip ==, +=, :=, subscript targets, etc.).
+		for i < len(content) && (content[i] == ' ' || content[i] == '\t') {
+			i++
+		}
+		if i >= len(content) || content[i] != '=' {
+			return "", "", false
+		}
+		if i+1 < len(content) && content[i+1] == '=' {
+			return "", "", false // comparison, not assignment
+		}
+		i++
+		for i < len(content) && (content[i] == ' ' || content[i] == '\t') {
+			i++
+		}
+
+		// RHS must be a bare string literal — no f/r/b/u prefix.
+		if i >= len(content) {
+			return "", "", false
+		}
+		q := content[i]
+		if q != '"' && q != '\'' {
+			return "", "", false
+		}
+
+		triple := i+2 < len(content) && content[i+1] == q && content[i+2] == q
+		var end int // index just past the closing quote
+		closed := false
+		if triple {
+			k := i + 3
+			for k < len(content) {
+				if content[k] == '\\' {
+					k += 2
+					continue
+				}
+				if content[k] == q && k+2 < len(content) && content[k+1] == q && content[k+2] == q {
+					end = k + 3
+					closed = true
+					break
+				}
+				k++
+			}
+		} else {
+			k := i + 1
+			for k < len(content) {
+				if content[k] == '\\' {
+					k += 2
+					continue
+				}
+				if content[k] == q {
+					end = k + 1
+					closed = true
+					break
+				}
+				k++
+			}
+		}
+		if !closed {
+			return "", "", false // unterminated or multi-line literal
+		}
+
+		// After the literal only whitespace or a single trailing comment is
+		// allowed. Anything else (concatenation, call, tuple, etc.) is unsafe.
+		rest := strings.Trim(content[end:], " \t\r")
+		if rest == "" {
+			return name, "", true
+		}
+		if strings.HasPrefix(rest, "#") {
+			return name, rest, true
+		}
+		return "", "", false
+	}
+
 	changed := false
 	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines))
 
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		if !strings.Contains(trimmed, `"`) || !strings.Contains(trimmed, `=`) {
-			out = append(out, line)
-			continue
-		}
-		if strings.Contains(trimmed, "os.environ.get(") || strings.Contains(trimmed, "# SEC-003") {
-			out = append(out, line)
-			continue
-		}
-
-		idx := strings.Index(trimmed, `=`)
-		varName := strings.TrimSpace(trimmed[:idx])
-		if !isSensitiveVar(varName) {
-			out = append(out, line)
-			continue
-		}
-
-		rhs := strings.TrimSpace(trimmed[idx+1:])
-		if !strings.HasPrefix(rhs, `"`) && !strings.HasPrefix(rhs, `'`) {
+		varName, comment, ok := parseAssignment(line)
+		if !ok {
 			out = append(out, line)
 			continue
 		}
 
 		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
 		envName := toEnvName(varName)
+
+		rewritten := fmt.Sprintf(`%s%s = os.getenv("%s")`, indent, varName, envName)
+		if comment != "" {
+			rewritten += "  " + comment
+		}
+
 		changed = true
-		out = append(out, fmt.Sprintf(`%s%s os.environ.get("%s")`, indent, strings.TrimSpace(trimmed[:idx+1]), envName))
+		out = append(out, rewritten)
 		out = append(out, fmt.Sprintf(`%s# %s`, indent, secretRotationNotice))
 		out = append(out, fmt.Sprintf(`%s# TODO: Set %s env var via deployment config. (SEC-003)`, indent, envName))
-		continue
 	}
 
 	if !changed {
