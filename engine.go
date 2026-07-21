@@ -659,7 +659,71 @@ func applyPythonSecretRewrite(src string) (string, bool) {
 }
 
 // applyJSSecretRewrite replaces hardcoded secret strings with process.env.NAME.
+//
+// JavaScript is rewritten as text (there is no JS parser in the Go stdlib, and a
+// secrets fixer must not pull in a heavyweight parser dependency). Rather than
+// approximate a parser, this uses a deliberately narrow string-literal detector
+// and refuses to act whenever it cannot rewrite correctly and safely: a fixer
+// that emits broken or lossy JS is worse than one that leaves the finding
+// reported. The prior implementation had two defects this addresses:
+//
+//  1. False negatives on single-quoted and template-literal secrets. It gated on
+//     the line containing a double quote (`strings.Contains(trimmed, "\"")`), so
+//     `const password = 'hunter2'` and `const password = ` + "`hunter2`" + ` were
+//     silently skipped and the secret stayed hardcoded.
+//  2. Data loss on the trailing content. It rebuilt the line from the left-hand
+//     side up to the `=` and appended `process.env.NAME`, discarding whatever
+//     followed the literal - the trailing `;` (inconsistent with the SQL and
+//     subprocess fixers, which preserve it) and any trailing `// comment`.
+//
+// The detector recognises exactly one shape: an assignment of a single string
+// literal to a sensitive-named identifier, optionally followed by a `;` and/or a
+// `// comment`. It SKIPS (returns the line unchanged, leaving the finding
+// reported) on anything it cannot preserve losslessly: template literals with
+// `${...}` interpolation (not a constant), concatenations (`"a" + b`), member or
+// object-property targets, and any trailing content other than `;`/`// comment`.
 func applyJSSecretRewrite(src string) (string, bool) {
+	// findAssignEq returns the index of the assignment `=` in s, skipping
+	// comparison and compound-assignment operators (==, ===, !==, <=, >=, +=,
+	// etc.). Returns -1 when there is no plain assignment.
+	findAssignEq := func(s string) int {
+		for i := 0; i < len(s); i++ {
+			if s[i] != '=' {
+				continue
+			}
+			if i+1 < len(s) && s[i+1] == '=' {
+				continue // start of == / === / etc.
+			}
+			if i > 0 {
+				switch s[i-1] {
+				case '=', '!', '<', '>', '+', '-', '*', '/', '%', '&', '|', '^', '~':
+					continue // tail of a compound/comparison operator
+				}
+			}
+			return i
+		}
+		return -1
+	}
+
+	// isPlainIdent reports whether s is a bare JS identifier. This deliberately
+	// rejects member expressions (`this.password`, `cfg.apiKey`) so object
+	// properties are skipped rather than mangled.
+	isPlainIdent := func(s string) bool {
+		if s == "" {
+			return false
+		}
+		for i, r := range s {
+			switch {
+			case r == '_' || r == '$':
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+			case i > 0 && r >= '0' && r <= '9':
+			default:
+				return false
+			}
+		}
+		return true
+	}
+
 	changed := false
 	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines))
@@ -667,41 +731,104 @@ func applyJSSecretRewrite(src string) (string, bool) {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		if !strings.Contains(trimmed, `"`) || !strings.Contains(trimmed, `=`) {
-			out = append(out, line)
-			continue
-		}
+		// Already remediated on this line -> leave untouched (idempotence).
 		if strings.Contains(trimmed, "process.env.") || strings.Contains(trimmed, "// SEC-003") {
 			out = append(out, line)
 			continue
 		}
 
-		idx := strings.Index(trimmed, `=`)
-		varName := strings.TrimSpace(trimmed[:idx])
-		for _, kw := range []string{"let ", "const ", "var "} {
-			varName = strings.TrimPrefix(varName, kw)
-		}
-		varName = strings.TrimSpace(varName)
-
-		if !isSensitiveVar(varName) {
+		eq := findAssignEq(trimmed)
+		if eq < 0 {
 			out = append(out, line)
 			continue
 		}
 
-		rhs := strings.TrimSpace(trimmed[idx+1:])
-		if !strings.HasPrefix(rhs, `"`) && !strings.HasPrefix(rhs, `'`) && !strings.HasPrefix(rhs, "`") {
+		// Left-hand side: optional const/let/var keyword + a bare identifier.
+		varName := strings.TrimSpace(trimmed[:eq])
+		for _, kw := range []string{"const ", "let ", "var "} {
+			if strings.HasPrefix(varName, kw) {
+				varName = strings.TrimSpace(strings.TrimPrefix(varName, kw))
+				break
+			}
+		}
+		if !isPlainIdent(varName) || !isSensitiveVar(varName) {
 			out = append(out, line)
 			continue
+		}
+
+		// Right-hand side must open with a string literal.
+		rhs := strings.TrimSpace(trimmed[eq+1:])
+		if rhs == "" {
+			out = append(out, line)
+			continue
+		}
+		quote := rhs[0]
+		if quote != '"' && quote != '\'' && quote != '`' {
+			out = append(out, line)
+			continue
+		}
+
+		// Scan to the matching close quote, honouring escapes. Skip on an
+		// unterminated literal or a template literal with `${...}` interpolation
+		// (an interpolated template is not a constant string).
+		closeIdx := -1
+		interpolated := false
+		for i := 1; i < len(rhs); i++ {
+			c := rhs[i]
+			if c == '\\' {
+				i++ // skip the escaped character
+				continue
+			}
+			if quote == '`' && c == '$' && i+1 < len(rhs) && rhs[i+1] == '{' {
+				interpolated = true
+				break
+			}
+			if c == quote {
+				closeIdx = i
+				break
+			}
+		}
+		if interpolated || closeIdx < 0 {
+			out = append(out, line)
+			continue
+		}
+
+		// Whatever follows the literal must be losslessly reproducible: nothing,
+		// a `;`, a `// comment`, or `; // comment`. Anything else (concatenation
+		// `+ b`, a further assignment, a method call, a `,`) means we do not
+		// understand the statement -> skip.
+		rest := strings.TrimSpace(rhs[closeIdx+1:])
+		trailingSemi := false
+		if strings.HasPrefix(rest, ";") {
+			trailingSemi = true
+			rest = strings.TrimSpace(rest[1:])
+		}
+		comment := ""
+		if rest != "" {
+			if strings.HasPrefix(rest, "//") {
+				comment = rest
+			} else {
+				out = append(out, line)
+				continue
+			}
 		}
 
 		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
 		envName := toEnvName(varName)
-		origPrefix := strings.TrimSpace(trimmed[:idx+1])
+		lhsPrefix := strings.TrimSpace(trimmed[:eq+1]) // includes the `=`
+
+		replacement := fmt.Sprintf("%s%s process.env.%s", indent, lhsPrefix, envName)
+		if trailingSemi {
+			replacement += ";"
+		}
+		if comment != "" {
+			replacement += " " + comment
+		}
+
 		changed = true
-		out = append(out, fmt.Sprintf(`%s%s process.env.%s`, indent, origPrefix, envName))
+		out = append(out, replacement)
 		out = append(out, fmt.Sprintf(`%s// %s`, indent, secretRotationNotice))
 		out = append(out, fmt.Sprintf(`%s// TODO: Set %s env var via deployment config. (SEC-003)`, indent, envName))
-		continue
 	}
 
 	if !changed {
