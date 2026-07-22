@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/nox-hq/nox/sdk"
@@ -1579,83 +1580,220 @@ func applyJSSQLParameterization(src string) (string, bool) {
 	return strings.Join(out, "\n"), true
 }
 
+// sec001ShellMeta is the set of characters whose presence in a command string
+// means a non-shell exec(argv...) would NOT reproduce the original behaviour:
+// pipes, redirects, sequencing, command substitution / backticks, globs,
+// brace/tilde expansion, history, background, escapes, and any quote (nested or
+// escaped). If the static command contains any of these we must not de-shell it.
+const sec001ShellMeta = "|&;<>$*?(){}~!'" + "`" + `"\`
+
+// applyGoSubprocessHardening de-shells a Go subprocess call, but ONLY in the one
+// case where doing so is provably behaviour-preserving.
+//
+// SEC-001 fires on exec.Command("sh", "-c", X) because X is normally assembled
+// from user/attacker-controlled input, and the shell then interprets any
+// metacharacters in it — that interpolation IS the injection. You CANNOT fix
+// that by tokenising X into argv: the instant X contains a pipe, redirect, glob,
+// command substitution, variable expansion, quoting, or is built by
+// concatenation, a direct exec.Command(argv...) stops reproducing the program's
+// behaviour. Rewriting it would either silently change runtime behaviour or emit
+// broken code — both strictly worse than leaving the finding reported. So we
+// recognise exactly ONE safe shape: a single, static string literal command with
+// no shell metacharacters and no interpolation, e.g.
+//
+//	exec.Command("sh", "-c", "ls -la /tmp")  ->  exec.Command("ls", "-la", "/tmp")
+//
+// Everything else returns (src, false), leaving the finding for a human. IMPORTANT:
+// this therefore does NOT remediate the typical interpolated command-injection
+// finding — a green scan after this fixer must not be read as "the injection was
+// fixed"; it only means a provably-static command was de-shelled.
 func applyGoSubprocessHardening(src string) (string, bool) {
-	changed := false
-	lines := strings.Split(src, "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !strings.Contains(trimmed, `exec.Command("sh", "-c", "`) {
-			out = append(out, line)
-			continue
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		// Not parseable Go: we cannot reason about it safely, so skip.
+		return src, false
+	}
+
+	// A single-line exec.Command("sh","-c",<static literal>) we can rewrite.
+	type rewrite struct {
+		line    int      // 1-based line of the call
+		colFrom int      // 1-based byte column of args[0]
+		colTo   int      // 1-based byte column just past args[2]
+		argv    []string // already-quoted argv tokens
+	}
+	var rewrites []rewrite
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
 		}
-		if strings.Contains(trimmed, "SEC-001") {
-			out = append(out, line)
-			continue
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel == nil || sel.Sel.Name != "Command" {
+			return true
 		}
-		start := strings.Index(trimmed, `exec.Command("sh", "-c", "`)
-		end := strings.Index(trimmed[start+len(`exec.Command("sh", "-c", "`):], `")`)
-		if end < 0 {
-			out = append(out, line)
-			continue
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "exec" {
+			return true
 		}
-		cmdBody := trimmed[start+len(`exec.Command("sh", "-c", "`) : start+len(`exec.Command("sh", "-c", "`)+end]
-		parts := strings.Fields(cmdBody)
+		if len(call.Args) != 3 {
+			return true
+		}
+		// Every argument must be a plain string literal. A variable or a
+		// concatenation (BinaryExpr) means the command is not provably static,
+		// which is exactly the interpolated case we must skip.
+		a0, ok0 := call.Args[0].(*ast.BasicLit)
+		a1, ok1 := call.Args[1].(*ast.BasicLit)
+		a2, ok2 := call.Args[2].(*ast.BasicLit)
+		if !ok0 || !ok1 || !ok2 ||
+			a0.Kind != token.STRING || a1.Kind != token.STRING || a2.Kind != token.STRING {
+			return true
+		}
+		shell, e0 := strconv.Unquote(a0.Value)
+		flag, e1 := strconv.Unquote(a1.Value)
+		cmd, e2 := strconv.Unquote(a2.Value)
+		if e0 != nil || e1 != nil || e2 != nil {
+			return true
+		}
+		if shell != "sh" || flag != "-c" {
+			return true
+		}
+		if strings.ContainsAny(cmd, sec001ShellMeta) {
+			return true
+		}
+		parts := strings.Fields(cmd)
 		if len(parts) == 0 {
-			out = append(out, line)
-			continue
+			return true
+		}
+		start := fset.Position(a0.Pos())
+		end := fset.Position(a2.End())
+		if start.Line != end.Line {
+			// Arguments span multiple lines; preserving layout is error-prone.
+			return true
 		}
 		argv := make([]string, 0, len(parts))
 		for _, p := range parts {
-			argv = append(argv, fmt.Sprintf("\"%s\"", p))
+			argv = append(argv, strconv.Quote(p))
 		}
-		repl := `exec.Command(` + strings.Join(argv, ", ") + `)`
-		newline := strings.Replace(line, `exec.Command("sh", "-c", "`+cmdBody+`")`, repl, 1)
-		out = append(out, newline)
+		rewrites = append(rewrites, rewrite{
+			line: start.Line, colFrom: start.Column, colTo: end.Column, argv: argv,
+		})
+		return true
+	})
+
+	if len(rewrites) == 0 {
+		return src, false
+	}
+
+	byLine := make(map[int][]rewrite)
+	for _, r := range rewrites {
+		byLine[r.line] = append(byLine[r.line], r)
+	}
+
+	lines := strings.Split(src, "\n")
+	out := make([]string, 0, len(lines)+len(rewrites))
+	changed := false
+	for i, line := range lines {
+		rs := byLine[i+1]
+		if len(rs) != 1 {
+			// Zero, or two overlapping calls on one line: leave the line alone.
+			out = append(out, line)
+			continue
+		}
+		r := rs[0]
+		if r.colFrom < 1 || r.colTo-1 > len(line) || r.colFrom >= r.colTo {
+			out = append(out, line)
+			continue
+		}
+		before := line[:r.colFrom-1] // indent + `c := exec.Command(`
+		after := line[r.colTo-1:]    // `)` + any trailing content / comment
 		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+		out = append(out, before+strings.Join(r.argv, ", ")+after)
 		out = append(out, indent+"// TODO: Validate command behavior without shell expansion. (SEC-001)")
 		changed = true
 	}
 	if !changed {
 		return src, false
 	}
-	return strings.Join(out, "\n"), true
+
+	result := strings.Join(out, "\n")
+	// The emitted call is still exec.Command, so os/exec stays imported and no new
+	// import is needed. Final safety net: never hand back Go that no longer parses.
+	if _, perr := parser.ParseFile(token.NewFileSet(), "", result, parser.ParseComments); perr != nil {
+		return src, false
+	}
+	return result, true
 }
 
+// applyPythonSubprocessHardening de-shells subprocess.run("<cmd>", shell=True),
+// but ONLY when <cmd> is a provably-static double-quoted literal with no shell
+// features. See applyGoSubprocessHardening for the full reasoning: an f-string,
+// a variable, a concatenation, or any shell metacharacter cannot be de-shelled
+// without changing behaviour, so those are skipped and left reported. This does
+// NOT remediate the typical interpolated command-injection finding.
+//
+//	subprocess.run("ls -la", shell=True)  ->  subprocess.run(["ls", "-la"], check=True)
 func applyPythonSubprocessHardening(src string) (string, bool) {
 	changed := false
 	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines))
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if !strings.Contains(trimmed, "subprocess.run(") || !strings.Contains(trimmed, "shell=True") {
+		if !strings.Contains(trimmed, "subprocess.run(") ||
+			!strings.Contains(trimmed, "shell=True") ||
+			strings.Contains(trimmed, "SEC-001") {
 			out = append(out, line)
 			continue
 		}
-		if !strings.Contains(trimmed, `"`) || strings.Contains(trimmed, "SEC-001") {
-			out = append(out, line)
-			continue
-		}
-		start := strings.Index(trimmed, `subprocess.run("`)
+		// The command must be the first positional arg as a double-quoted string
+		// literal. subprocess.run(cmd, ...) (a variable) and subprocess.run(f"...")
+		// (an f-string) do not contain this exact prefix, so they are skipped —
+		// exactly the interpolated cases we must not touch.
+		const marker = `subprocess.run("`
+		start := strings.Index(trimmed, marker)
 		if start < 0 {
 			out = append(out, line)
 			continue
 		}
-		rest := trimmed[start+len(`subprocess.run("`):]
+		rest := trimmed[start+len(marker):]
 		end := strings.Index(rest, `"`)
 		if end < 0 {
 			out = append(out, line)
 			continue
 		}
 		cmdBody := rest[:end]
+		// Split off a trailing comment so it can be preserved.
+		afterQuote := rest[end+1:]
+		code, comment := afterQuote, ""
+		if h := strings.Index(afterQuote, "#"); h >= 0 {
+			code, comment = afterQuote[:h], strings.TrimSpace(afterQuote[h:])
+		}
+		// The remainder must be EXACTLY the shell=True call and nothing else.
+		// Anything else — additional kwargs we would silently drop, or a `+ var`
+		// concatenation right after the literal — means we cannot rewrite safely.
+		if strings.ReplaceAll(strings.TrimSpace(code), " ", "") != ",shell=True)" {
+			out = append(out, line)
+			continue
+		}
+		if strings.ContainsAny(cmdBody, sec001ShellMeta) {
+			out = append(out, line)
+			continue
+		}
 		parts := strings.Fields(cmdBody)
 		if len(parts) == 0 {
 			out = append(out, line)
 			continue
 		}
-		argv := "[\"" + strings.Join(parts, "\", \"") + "\"]"
+		quoted := make([]string, 0, len(parts))
+		for _, p := range parts {
+			quoted = append(quoted, strconv.Quote(p))
+		}
 		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-		out = append(out, indent+`subprocess.run(`+argv+`, check=True)`)
+		newline := indent + `subprocess.run([` + strings.Join(quoted, ", ") + `], check=True)`
+		if comment != "" {
+			newline += "  " + comment
+		}
+		out = append(out, newline)
 		out = append(out, indent+"# TODO: Validate command behavior without shell expansion. (SEC-001)")
 		changed = true
 	}
@@ -1665,46 +1803,203 @@ func applyPythonSubprocessHardening(src string) (string, bool) {
 	return strings.Join(out, "\n"), true
 }
 
+// applyJSSubprocessHardening de-shells a child_process exec("<cmd>") call into
+// execFile("<cmd0>", [args...]), but ONLY when it is safe and verifiable.
+//
+// Two extra hazards beyond the Go/Python cases:
+//  1. execFile must be in scope. child_process is used two ways: a namespace
+//     binding (`const cp = require("child_process")` -> `cp.exec(...)`), where
+//     cp.execFile is guaranteed to exist; and a destructured binding
+//     (`const { exec } = require("child_process")` -> bare `exec(...)`), where
+//     execFile may NOT have been imported. For the destructured form we add
+//     execFile to the very same binding we read exec from, so we never emit a
+//     call to an unimported symbol (the SEC-003 missing-import lesson).
+//  2. RegExp.prototype.exec looks identical to a subprocess exec on a substring
+//     match. We only rewrite calls tied to a resolved child_process binding — a
+//     member call on the namespace name, or a BARE exec call (never preceded by
+//     a dot) when exec was destructured from child_process — so an unrelated
+//     `regex.exec("input")` is left alone.
+//
+// As with Go/Python, only a static double-quoted literal with no shell
+// metacharacters is rewritten; template literals, variables, concatenation, and
+// metacharacters are skipped and left reported. This does NOT remediate the
+// typical interpolated command-injection finding.
 func applyJSSubprocessHardening(src string) (string, bool) {
-	changed := false
 	lines := strings.Split(src, "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !strings.Contains(trimmed, `exec("`) || strings.Contains(trimmed, "SEC-001") {
-			out = append(out, line)
+
+	isIdentChar := func(b byte) bool {
+		return b == '_' || b == '$' ||
+			(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+	}
+	isIdent := func(s string) bool {
+		if s == "" {
+			return false
+		}
+		for i := 0; i < len(s); i++ {
+			if !isIdentChar(s[i]) {
+				return false
+			}
+			if i == 0 && s[i] >= '0' && s[i] <= '9' {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Resolve how child_process is bound in this file. We support a namespace
+	// binding (nsBinding) and a destructured { exec } binding (destructLine points
+	// at the import line so we can add execFile to it if we rewrite a bare call).
+	nsBinding := ""
+	destructLine := -1
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if !strings.Contains(t, "child_process") {
 			continue
 		}
-		start := strings.Index(trimmed, `exec("`)
-		rest := trimmed[start+len(`exec("`):]
-		end := strings.Index(rest, `"`)
+		var decl string
+		switch {
+		case strings.Contains(t, "require("):
+			// const X = require('child_process')  OR  const { exec } = require(...)
+			eq := strings.Index(t, "=")
+			req := strings.Index(t, "require(")
+			if eq < 0 || eq > req {
+				continue
+			}
+			decl = strings.TrimSpace(t[:eq])
+			for _, kw := range []string{"const ", "let ", "var "} {
+				decl = strings.TrimPrefix(decl, kw)
+			}
+			decl = strings.TrimSpace(decl)
+		case strings.HasPrefix(t, "import "):
+			// import X from 'child_process' / import * as X / import { exec }
+			from := strings.Index(t, " from ")
+			if from < 0 {
+				continue
+			}
+			spec := strings.TrimSpace(strings.TrimPrefix(t[:from], "import"))
+			if strings.HasPrefix(spec, "* as ") {
+				spec = strings.TrimSpace(strings.TrimPrefix(spec, "* as "))
+			}
+			decl = spec
+		default:
+			continue
+		}
+		switch {
+		case isIdent(decl):
+			if nsBinding == "" {
+				nsBinding = decl
+			}
+		case strings.HasPrefix(decl, "{") && strings.Contains(decl, "}"):
+			// Destructured binding; only usable if it actually pulls in exec.
+			inner := decl[strings.Index(decl, "{")+1 : strings.Index(decl, "}")]
+			for _, name := range strings.Split(inner, ",") {
+				if strings.TrimSpace(name) == "exec" {
+					destructLine = i
+				}
+			}
+		}
+	}
+	if nsBinding == "" && destructLine < 0 {
+		// No verifiable child_process binding: skip the whole file rather than
+		// risk rewriting an unrelated exec (e.g. RegExp.exec).
+		return src, false
+	}
+
+	// tryRewrite attempts to de-shell one exec call on a line, given the index
+	// just past the opening quote of the command literal and the callPrefix that
+	// replaces the matched exec token (e.g. "cp.execFile(" or "execFile(").
+	// It returns the rewritten line and true, or ("", false) to leave the line.
+	rewriteCall := func(line string, before string, afterOpenQuote string, callPrefix string) (string, bool) {
+		end := strings.Index(afterOpenQuote, `"`)
 		if end < 0 {
-			out = append(out, line)
-			continue
+			return "", false
 		}
-		cmdBody := rest[:end]
+		cmdBody := afterOpenQuote[:end]
+		suffix := afterOpenQuote[end+1:] // ')', callback/options, trailing comment
+		if strings.HasPrefix(strings.TrimLeft(suffix, " "), "+") {
+			// concatenation, not a lone static literal
+			return "", false
+		}
+		if strings.ContainsAny(cmdBody, sec001ShellMeta) {
+			return "", false
+		}
 		parts := strings.Fields(cmdBody)
 		if len(parts) == 0 {
+			return "", false
+		}
+		argsQuoted := make([]string, 0, len(parts)-1)
+		for _, a := range parts[1:] {
+			argsQuoted = append(argsQuoted, strconv.Quote(a))
+		}
+		return before + callPrefix + strconv.Quote(parts[0]) + `, [` + strings.Join(argsQuoted, ", ") + `]` + suffix, true
+	}
+
+	out := make([]string, 0, len(lines))
+	changed := false
+	addedBareRewrite := false
+	destructOutIdx := -1 // index in out of the destructuring import line
+	for i, line := range lines {
+		if i == destructLine {
+			destructOutIdx = len(out)
+		}
+		if strings.Contains(line, "SEC-001") {
 			out = append(out, line)
 			continue
 		}
-		cmd := parts[0]
-		args := parts[1:]
-		argsQuoted := make([]string, 0, len(args))
-		for _, a := range args {
-			argsQuoted = append(argsQuoted, fmt.Sprintf("\"%s\"", a))
-		}
 		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-		suffix := ""
-		if strings.Contains(trimmed, ",") {
-			suffix = rest[end+1:]
+
+		// Namespace member call: <nsBinding>.exec("...")
+		if nsBinding != "" {
+			marker := nsBinding + `.exec("`
+			if idx := strings.Index(line, marker); idx >= 0 &&
+				(idx == 0 || !isIdentChar(line[idx-1])) {
+				if newline, ok := rewriteCall(line, line[:idx], line[idx+len(marker):], nsBinding+".execFile("); ok {
+					out = append(out, newline)
+					out = append(out, indent+"// TODO: Validate command behavior without shell expansion. (SEC-001)")
+					changed = true
+					continue
+				}
+			}
 		}
-		out = append(out, indent+`execFile("`+cmd+`", [`+strings.Join(argsQuoted, ", ")+`]`+suffix)
-		out = append(out, indent+"// TODO: Validate command behavior without shell expansion. (SEC-001)")
-		changed = true
+
+		// Bare destructured call: exec("...") not preceded by a dot or identifier.
+		if destructLine >= 0 {
+			marker := `exec("`
+			if idx := strings.Index(line, marker); idx >= 0 &&
+				(idx == 0 || (!isIdentChar(line[idx-1]) && line[idx-1] != '.')) {
+				if newline, ok := rewriteCall(line, line[:idx], line[idx+len(marker):], "execFile("); ok {
+					out = append(out, newline)
+					out = append(out, indent+"// TODO: Validate command behavior without shell expansion. (SEC-001)")
+					changed = true
+					addedBareRewrite = true
+					continue
+				}
+			}
+		}
+
+		out = append(out, line)
 	}
 	if !changed {
 		return src, false
 	}
+
+	// If we rewrote a bare destructured exec call to execFile, execFile must be
+	// pulled into the same binding, or we would reference an unimported symbol.
+	if addedBareRewrite && destructOutIdx >= 0 {
+		imp := out[destructOutIdx]
+		o := strings.Index(imp, "{")
+		c := strings.Index(imp, "}")
+		if !strings.Contains(imp, "execFile") && o >= 0 && c > o {
+			names := make([]string, 0)
+			for _, name := range strings.Split(imp[o+1:c], ",") {
+				if n := strings.TrimSpace(name); n != "" {
+					names = append(names, n)
+				}
+			}
+			names = append(names, "execFile")
+			out[destructOutIdx] = imp[:o] + "{ " + strings.Join(names, ", ") + " }" + imp[c+1:]
+		}
+	}
+
 	return strings.Join(out, "\n"), true
 }
