@@ -1082,75 +1082,337 @@ func applyJSSecretRewrite(src string) (string, bool) {
 	return strings.Join(out, "\n"), true
 }
 
+// SEC-002 SQL parameterization is deliberately narrow. SQL placeholders (?, %s,
+// $1) bind VALUES only -- never identifiers (table/column names). A placeholder
+// substituted at an identifier position produces invalid or silently-wrong SQL,
+// which is worse than leaving the finding reported. The three fixers below
+// therefore recognise exactly ONE safe shape:
+//
+//	CALL( "<SQL fragment ending at a value position>" + <one identifier> )
+//	  e.g.  db.Query("SELECT * FROM users WHERE id = " + id)
+//	     -> db.Query("SELECT * FROM users WHERE id = ?", id)
+//
+// and return (src, false) -- leaving the finding for a human -- for everything
+// else: dynamic table/column names ("SELECT * FROM " + t, "ORDER BY " + col),
+// more than one concatenated variable, interleaved literal/var/literal, format
+// strings / f-strings / template literals, or any trailing content that cannot
+// be preserved. This is NOT a general SQL-injection fix; it handles the textbook
+// single-value concatenation and declines the rest by design.
+
 func applyGoSQLParameterization(src string) (string, bool) {
-	changed := false
+	const todo = "// TODO: Verify SQL semantics and placeholders. (SEC-002)"
+	isAlpha := func(c byte) bool {
+		return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	}
+	isIdent := func(c byte) bool {
+		return isAlpha(c) || (c >= '0' && c <= '9') || c == '.'
+	}
+	// valuePos reports whether an SQL fragment ends where a single bound value is
+	// legal: after a comparison operator (= < > <= >= != <>) or LIKE. Identifier
+	// positions (FROM/JOIN/ORDER BY and bare table/column names) end with a plain
+	// word and are rejected -- the single most important guard, since a placeholder
+	// there is invalid or subtly-wrong SQL. IN (...) / VALUES (...) are also
+	// declined: with one trailing variable the ')' belongs to the call, not the
+	// SQL, so a rewrite would drop the SQL's closing paren and IN wants a list, not
+	// a scalar -- both would emit broken SQL.
+	valuePos := func(content string) bool {
+		wordSuffix := func(s, w string) bool {
+			if !strings.HasSuffix(s, w) {
+				return false
+			}
+			if len(s) == len(w) {
+				return true
+			}
+			c := s[len(s)-len(w)-1]
+			return c == ' ' || c == '\t' || c == '(' || c == ','
+		}
+		s := strings.TrimRight(content, " \t")
+		if s == "" {
+			return false
+		}
+		switch s[len(s)-1] {
+		case '=', '<', '>':
+			return true
+		}
+		up := strings.ToUpper(s)
+		return wordSuffix(up, "LIKE")
+	}
+	// splitComment separates a trailing // comment (outside any string literal)
+	// from code, preserving the exact whitespace gap for verbatim re-appending.
+	splitComment := func(line string) (code, trailer string) {
+		var inStr byte
+		for i := 0; i < len(line); i++ {
+			c := line[i]
+			if inStr != 0 {
+				if c == '\\' && inStr != '`' {
+					i++
+					continue
+				}
+				if c == inStr {
+					inStr = 0
+				}
+				continue
+			}
+			if c == '"' || c == '`' {
+				inStr = c
+				continue
+			}
+			if c == '/' && i+1 < len(line) && line[i+1] == '/' {
+				code = strings.TrimRight(line[:i], " \t")
+				return code, line[len(code):]
+			}
+		}
+		return line, ""
+	}
+
 	lines := strings.Split(src, "\n")
-	for i, line := range lines {
-		if !strings.Contains(line, "Query(") && !strings.Contains(line, "Exec(") {
+	out := make([]string, 0, len(lines))
+	changed := false
+	for _, line := range lines {
+		if (!strings.Contains(line, "Query(") && !strings.Contains(line, "Exec(")) ||
+			!strings.Contains(line, "+") || !strings.Contains(line, `"`) ||
+			strings.Contains(line, "SEC-002") || strings.Contains(line, "?") {
+			out = append(out, line)
 			continue
 		}
-		if !strings.Contains(line, `"`) || !strings.Contains(line, `+`) {
+		code, trailer := splitComment(line)
+		indent := code[:len(code)-len(strings.TrimLeft(code, " \t"))]
+
+		// First Go string literal: "..." (with \ escapes) or `...` (raw).
+		qi := strings.IndexAny(code, "\"`")
+		if qi < 0 {
+			out = append(out, line)
 			continue
 		}
-		if strings.Contains(line, "SEC-002") || strings.Contains(line, "?") {
+		d := code[qi]
+		end := -1
+		if d == '`' {
+			if rel := strings.IndexByte(code[qi+1:], '`'); rel >= 0 {
+				end = qi + 1 + rel
+			}
+		} else {
+			for j := qi + 1; j < len(code); j++ {
+				if code[j] == '\\' {
+					j++
+					continue
+				}
+				if code[j] == d {
+					end = j
+					break
+				}
+			}
+		}
+		if end < 0 {
+			out = append(out, line)
 			continue
 		}
-		idxPlus := strings.Index(line, "+")
-		idxClose := strings.LastIndex(line, ")")
-		if idxPlus < 0 || idxClose < idxPlus {
+		content := code[qi+1 : end]
+
+		// After the literal: optional spaces, then exactly one '+'.
+		k := end + 1
+		for k < len(code) && (code[k] == ' ' || code[k] == '\t') {
+			k++
+		}
+		if k >= len(code) || code[k] != '+' {
+			out = append(out, line)
 			continue
 		}
-		arg := strings.TrimSpace(strings.TrimRight(line[idxPlus+1:idxClose], ","))
-		if arg == "" || strings.Contains(arg, " ") {
+		k++
+		for k < len(code) && (code[k] == ' ' || code[k] == '\t') {
+			k++
+		}
+		// Exactly one simple (optionally dotted) identifier, e.g. id or req.id.
+		vs := k
+		if k >= len(code) || !isAlpha(code[k]) {
+			out = append(out, line)
 			continue
 		}
-		beforePlus := line[:idxPlus]
-		quotePos := strings.LastIndex(beforePlus, `"`)
-		if quotePos < 0 {
+		for k < len(code) && isIdent(code[k]) {
+			k++
+		}
+		variable := code[vs:k]
+		// Remainder may only be close-parens/semicolons/spaces, with >=1 ')'.
+		// Anything else (a second '+', another literal, a comma) means this is
+		// not the single-value shape, so we decline.
+		rest := code[k:]
+		hasClose, badRest := false, false
+		for i := 0; i < len(rest); i++ {
+			switch rest[i] {
+			case ')':
+				hasClose = true
+			case ';', ' ', '\t':
+			default:
+				badRest = true
+			}
+		}
+		if badRest || !hasClose {
+			out = append(out, line)
 			continue
 		}
-		prefix := line[:quotePos]
-		suffix := line[idxClose:]
-		lines[i] = prefix + `?", ` + arg + suffix
-		lines = append(lines[:i+1], append([]string{"// TODO: Verify SQL semantics and placeholders. (SEC-002)"}, lines[i+1:]...)...)
+		if !valuePos(content) {
+			out = append(out, line)
+			continue
+		}
+		before := code[:qi]
+		newCode := before + string(d) + content + "?" + string(d) + ", " + variable + rest
+		out = append(out, newCode+trailer)
+		out = append(out, indent+todo)
 		changed = true
-		i++
 	}
 	if !changed {
 		return src, false
 	}
-	return strings.Join(lines, "\n"), true
+	return strings.Join(out, "\n"), true
 }
 
 func applyPythonSQLParameterization(src string) (string, bool) {
-	changed := false
+	const todo = "# TODO: Verify SQL semantics and placeholders. (SEC-002)"
+	isAlpha := func(c byte) bool {
+		return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	}
+	isIdent := func(c byte) bool {
+		return isAlpha(c) || (c >= '0' && c <= '9') || c == '.'
+	}
+	// valuePos reports whether an SQL fragment ends where a single bound value is
+	// legal: after a comparison operator (= < > <= >= != <>) or LIKE. Identifier
+	// positions (FROM/JOIN/ORDER BY and bare table/column names) end with a plain
+	// word and are rejected -- the single most important guard, since a placeholder
+	// there is invalid or subtly-wrong SQL. IN (...) / VALUES (...) are also
+	// declined: with one trailing variable the ')' belongs to the call, not the
+	// SQL, so a rewrite would drop the SQL's closing paren and IN wants a list, not
+	// a scalar -- both would emit broken SQL.
+	valuePos := func(content string) bool {
+		wordSuffix := func(s, w string) bool {
+			if !strings.HasSuffix(s, w) {
+				return false
+			}
+			if len(s) == len(w) {
+				return true
+			}
+			c := s[len(s)-len(w)-1]
+			return c == ' ' || c == '\t' || c == '(' || c == ','
+		}
+		s := strings.TrimRight(content, " \t")
+		if s == "" {
+			return false
+		}
+		switch s[len(s)-1] {
+		case '=', '<', '>':
+			return true
+		}
+		up := strings.ToUpper(s)
+		return wordSuffix(up, "LIKE")
+	}
+	// splitComment separates a trailing # comment (outside any string) from code.
+	splitComment := func(line string) (code, trailer string) {
+		var inStr byte
+		for i := 0; i < len(line); i++ {
+			c := line[i]
+			if inStr != 0 {
+				if c == '\\' {
+					i++
+					continue
+				}
+				if c == inStr {
+					inStr = 0
+				}
+				continue
+			}
+			if c == '"' || c == '\'' {
+				inStr = c
+				continue
+			}
+			if c == '#' {
+				code = strings.TrimRight(line[:i], " \t")
+				return code, line[len(code):]
+			}
+		}
+		return line, ""
+	}
+
 	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines))
+	changed := false
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !strings.Contains(trimmed, ".execute(") || !strings.Contains(trimmed, `+`) || !strings.Contains(trimmed, `"`) {
+		// Note: both quote styles are handled -- single quotes are the dominant
+		// Python string style and were previously skipped (false negative).
+		if !strings.Contains(line, ".execute(") ||
+			!strings.Contains(line, "+") ||
+			(!strings.Contains(line, `"`) && !strings.Contains(line, "'")) ||
+			strings.Contains(line, "SEC-002") || strings.Contains(line, "%s") {
 			out = append(out, line)
 			continue
 		}
-		if strings.Contains(trimmed, "SEC-002") || strings.Contains(trimmed, "%s") {
+		code, trailer := splitComment(line)
+		indent := code[:len(code)-len(strings.TrimLeft(code, " \t"))]
+
+		qi := strings.IndexAny(code, "\"'")
+		if qi < 0 {
 			out = append(out, line)
 			continue
 		}
-		idxPlus := strings.Index(trimmed, "+")
-		idxClose := strings.LastIndex(trimmed, ")")
-		if idxPlus < 0 || idxClose < idxPlus {
+		d := code[qi]
+		end := -1
+		for j := qi + 1; j < len(code); j++ {
+			if code[j] == '\\' {
+				j++
+				continue
+			}
+			if code[j] == d {
+				end = j
+				break
+			}
+		}
+		if end < 0 {
 			out = append(out, line)
 			continue
 		}
-		arg := strings.TrimSpace(trimmed[idxPlus+1 : idxClose])
-		if arg == "" || strings.Contains(arg, " ") {
+		content := code[qi+1 : end]
+
+		k := end + 1
+		for k < len(code) && (code[k] == ' ' || code[k] == '\t') {
+			k++
+		}
+		if k >= len(code) || code[k] != '+' {
 			out = append(out, line)
 			continue
 		}
-		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-		prefix := strings.TrimSpace(trimmed[:idxPlus])
-		out = append(out, indent+prefix+` %s", (`+arg+`,))`)
-		out = append(out, indent+"# TODO: Verify SQL semantics and placeholders. (SEC-002)")
+		k++
+		for k < len(code) && (code[k] == ' ' || code[k] == '\t') {
+			k++
+		}
+		vs := k
+		if k >= len(code) || !isAlpha(code[k]) {
+			out = append(out, line)
+			continue
+		}
+		for k < len(code) && isIdent(code[k]) {
+			k++
+		}
+		variable := code[vs:k]
+		rest := code[k:]
+		hasClose, badRest := false, false
+		for i := 0; i < len(rest); i++ {
+			switch rest[i] {
+			case ')':
+				hasClose = true
+			case ';', ' ', '\t':
+			default:
+				badRest = true
+			}
+		}
+		if badRest || !hasClose {
+			out = append(out, line)
+			continue
+		}
+		if !valuePos(content) {
+			out = append(out, line)
+			continue
+		}
+		before := code[:qi]
+		newCode := before + string(d) + content + "%s" + string(d) + ", (" + variable + ",)" + rest
+		out = append(out, newCode+trailer)
+		out = append(out, indent+todo)
 		changed = true
 	}
 	if !changed {
@@ -1160,39 +1422,155 @@ func applyPythonSQLParameterization(src string) (string, bool) {
 }
 
 func applyJSSQLParameterization(src string) (string, bool) {
-	changed := false
+	const todo = "// TODO: Verify SQL semantics and placeholders. (SEC-002)"
+	isAlpha := func(c byte) bool {
+		return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	}
+	isIdent := func(c byte) bool {
+		return isAlpha(c) || (c >= '0' && c <= '9') || c == '.'
+	}
+	// valuePos reports whether an SQL fragment ends where a single bound value is
+	// legal: after a comparison operator (= < > <= >= != <>) or LIKE. Identifier
+	// positions (FROM/JOIN/ORDER BY and bare table/column names) end with a plain
+	// word and are rejected -- the single most important guard, since a placeholder
+	// there is invalid or subtly-wrong SQL. IN (...) / VALUES (...) are also
+	// declined: with one trailing variable the ')' belongs to the call, not the
+	// SQL, so a rewrite would drop the SQL's closing paren and IN wants a list, not
+	// a scalar -- both would emit broken SQL.
+	valuePos := func(content string) bool {
+		wordSuffix := func(s, w string) bool {
+			if !strings.HasSuffix(s, w) {
+				return false
+			}
+			if len(s) == len(w) {
+				return true
+			}
+			c := s[len(s)-len(w)-1]
+			return c == ' ' || c == '\t' || c == '(' || c == ','
+		}
+		s := strings.TrimRight(content, " \t")
+		if s == "" {
+			return false
+		}
+		switch s[len(s)-1] {
+		case '=', '<', '>':
+			return true
+		}
+		up := strings.ToUpper(s)
+		return wordSuffix(up, "LIKE")
+	}
+	// splitComment separates a trailing // comment (outside any string, including
+	// template literals) from code. Template literals are tracked so their
+	// contents can't be mistaken for a comment; they are not rewritten.
+	splitComment := func(line string) (code, trailer string) {
+		var inStr byte
+		for i := 0; i < len(line); i++ {
+			c := line[i]
+			if inStr != 0 {
+				if c == '\\' && inStr != '`' {
+					i++
+					continue
+				}
+				if c == inStr {
+					inStr = 0
+				}
+				continue
+			}
+			if c == '"' || c == '\'' || c == '`' {
+				inStr = c
+				continue
+			}
+			if c == '/' && i+1 < len(line) && line[i+1] == '/' {
+				code = strings.TrimRight(line[:i], " \t")
+				return code, line[len(code):]
+			}
+		}
+		return line, ""
+	}
+
 	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines))
+	changed := false
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !(strings.Contains(trimmed, ".query(") || strings.Contains(trimmed, ".execute(")) || !strings.Contains(trimmed, `+`) || !strings.Contains(trimmed, `"`) {
+		if (!strings.Contains(line, ".query(") && !strings.Contains(line, ".execute(")) ||
+			!strings.Contains(line, "+") ||
+			(!strings.Contains(line, `"`) && !strings.Contains(line, "'")) ||
+			strings.Contains(line, "SEC-002") || strings.Contains(line, "?") {
 			out = append(out, line)
 			continue
 		}
-		if strings.Contains(trimmed, "SEC-002") || strings.Contains(trimmed, "?") {
+		code, trailer := splitComment(line)
+		indent := code[:len(code)-len(strings.TrimLeft(code, " \t"))]
+
+		// Only ' and " are candidate SQL literals; backtick template literals are
+		// a different shape (interpolation) and are out of scope -- skipped.
+		qi := strings.IndexAny(code, "\"'")
+		if qi < 0 {
 			out = append(out, line)
 			continue
 		}
-		idxPlus := strings.Index(trimmed, "+")
-		idxClose := strings.LastIndex(trimmed, ")")
-		if idxPlus < 0 || idxClose < idxPlus {
-			out = append(out, line)
-			continue
-		}
-		arg := strings.TrimSpace(strings.TrimRight(trimmed[idxPlus+1:idxClose], ";"))
-		if arg == "" || strings.Contains(arg, " ") {
-			out = append(out, line)
-			continue
-		}
-		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-		prefix := strings.TrimSpace(trimmed[:idxPlus])
-		out = append(out, indent+prefix+` ?", [`+arg+`])`+func() string {
-			if strings.HasSuffix(strings.TrimSpace(line), ";") {
-				return ";"
+		d := code[qi]
+		end := -1
+		for j := qi + 1; j < len(code); j++ {
+			if code[j] == '\\' {
+				j++
+				continue
 			}
-			return ""
-		}())
-		out = append(out, indent+"// TODO: Verify SQL semantics and placeholders. (SEC-002)")
+			if code[j] == d {
+				end = j
+				break
+			}
+		}
+		if end < 0 {
+			out = append(out, line)
+			continue
+		}
+		content := code[qi+1 : end]
+
+		k := end + 1
+		for k < len(code) && (code[k] == ' ' || code[k] == '\t') {
+			k++
+		}
+		if k >= len(code) || code[k] != '+' {
+			out = append(out, line)
+			continue
+		}
+		k++
+		for k < len(code) && (code[k] == ' ' || code[k] == '\t') {
+			k++
+		}
+		vs := k
+		if k >= len(code) || !isAlpha(code[k]) {
+			out = append(out, line)
+			continue
+		}
+		for k < len(code) && isIdent(code[k]) {
+			k++
+		}
+		variable := code[vs:k]
+		rest := code[k:]
+		hasClose, badRest := false, false
+		for i := 0; i < len(rest); i++ {
+			switch rest[i] {
+			case ')':
+				hasClose = true
+			case ';', ' ', '\t':
+			default:
+				badRest = true
+			}
+		}
+		if badRest || !hasClose {
+			out = append(out, line)
+			continue
+		}
+		if !valuePos(content) {
+			out = append(out, line)
+			continue
+		}
+		before := code[:qi]
+		newCode := before + string(d) + content + "?" + string(d) + ", [" + variable + "]" + rest
+		out = append(out, newCode+trailer)
+		out = append(out, indent+todo)
 		changed = true
 	}
 	if !changed {
