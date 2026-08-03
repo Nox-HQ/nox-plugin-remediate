@@ -3,7 +3,7 @@ module github.com/nox-hq/nox-plugin-remediate
 go 1.26.5
 
 require (
-	github.com/nox-hq/nox v1.24.0
+	github.com/nox-hq/nox v1.26.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
