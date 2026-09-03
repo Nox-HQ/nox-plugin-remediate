@@ -13,24 +13,63 @@ import (
 
 var version = "dev"
 
-func buildServer() *sdk.PluginServer {
-	manifest := sdk.NewManifest("nox/remediate", version).
+// buildManifest declares what this plugin is allowed to do. Split out of
+// buildServer so the safety declarations can be asserted directly: they are
+// the difference between a scan getting fix plans and getting nothing.
+func buildManifest() *pluginv1.GetManifestResponse {
+	return sdk.NewManifest("nox/remediate", version).
 		Capability("remediate", "Deterministic remediation planning and application for code findings").
+		// Per-tool safety, declared honestly rather than copied from the
+		// plugin-level ceiling.
+		//
+		// Without it every tool inherits that ceiling, so a passive policy —
+		// the default, and what `nox scan` uses — refused the whole plugin and
+		// took the read-only planner down with the two writers. The host is
+		// built for exactly this shape: ValidateManifest admits a plugin whose
+		// ceiling exceeds the policy when some tool declares narrower
+		// requirements the policy allows, and refuses the others individually
+		// at invocation.
+		//
+		// plan_code walks the workspace it is handed and returns patches. It
+		// writes nothing — PatchEngine.Plan has no filesystem writes — so it is
+		// passive and needs no file_paths grant, exactly like every analysis
+		// plugin that reads the workspace root it is given.
 		ToolWithContext("plan_code", "Plan deterministic code remediations for supported rules", true).
+		ToolSafety(sdk.WithRiskClass(sdk.RiskPassive)).
+		// apply_code writes patched files back to the workspace.
 		ToolWithContext("apply_code", "Apply deterministic code remediations from a prepared plan", false).
+		ToolSafety(
+			sdk.WithRiskClass(sdk.RiskActive),
+			sdk.WithNeedsConfirmation(),
+			sdk.WithFilePaths("**"),
+		).
+		// verify_code runs `sh -c` with an operator-supplied command (gated by
+		// policy.Verify.AllowedCommands). Arbitrary execution is active whatever
+		// the allowlist says.
 		ToolWithContext("verify_code", "Verify remediation changes and emit pass/fail diagnostics", false).
+		ToolSafety(
+			sdk.WithRiskClass(sdk.RiskActive),
+			sdk.WithNeedsConfirmation(),
+			sdk.WithFilePaths("**"),
+		).
 		Done().
+		// The plugin-level block stays the ceiling: everything this plugin
+		// might ever need, visible to an operator before anything runs.
 		Safety(
 			sdk.WithRiskClass(sdk.RiskActive),
 			sdk.WithNeedsConfirmation(),
 			sdk.WithFilePaths("**"),
 		).
 		Build()
+}
+
+func buildServer() *sdk.PluginServer {
+	manifest := buildManifest()
 
 	engine := NewPatchEngine()
 	guardrails := Guardrails{
-		MaxFiles:       25,
-		MaxAddedLines:  800,
+		MaxFiles:        25,
+		MaxAddedLines:   800,
 		MaxRemovedLines: 800,
 	}
 
