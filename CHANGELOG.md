@@ -2,6 +2,8 @@
 
 All notable changes to this project will be documented in this file.
 
+- fix(safety): plan_code declares its own passive requirements, so a passive
+  scan keeps the planner instead of refusing the whole plugin (#22)
 - chore(deps): Go 1.26.5 and nox SDK v1.17.0 (#14)
 - chore(security): nox remediation (deps + actions) (#13)
 - ci: add nox-remediate caller (deps + action-pin remediation)
