@@ -1,0 +1,553 @@
+{
+  "meta": {
+    "schema_version": "1.0.0",
+    "generated_at": "2026-09-19T10:10:43Z",
+    "tool_name": "nox",
+    "tool_version": "1.38.2",
+    "offline": false,
+    "sast_languages": {
+      "c": "standard",
+      "cpp": "standard",
+      "csharp": "standard",
+      "go": "standard",
+      "java": "standard",
+      "javascript": "deep",
+      "kotlin": "standard",
+      "objc": "standard",
+      "php": "standard",
+      "python": "deep",
+      "ruby": "standard",
+      "rust": "standard",
+      "shell": "standard",
+      "swift": "standard",
+      "typescript": "deep"
+    },
+    "capabilities": [
+      {
+        "capability": "lexical_context",
+        "provided": true,
+        "providers": [
+          "core/lexctx"
+        ],
+        "answered": 0,
+        "inconclusive": 0
+      },
+      {
+        "capability": "constant_evaluation",
+        "provided": true,
+        "providers": [
+          "core/consteval"
+        ],
+        "answered": 0,
+        "inconclusive": 0
+      },
+      {
+        "capability": "symbol_resolution",
+        "provided": true,
+        "providers": [
+          "core/taint"
+        ],
+        "answered": 0,
+        "inconclusive": 1
+      },
+      {
+        "capability": "taint",
+        "provided": true,
+        "providers": [
+          "core/taint"
+        ],
+        "answered": 0,
+        "inconclusive": 0
+      },
+      {
+        "capability": "call_graph",
+        "provided": true,
+        "providers": [
+          "core/callgraph"
+        ],
+        "answered": 0,
+        "inconclusive": 0
+      },
+      {
+        "capability": "entry_point",
+        "provided": true,
+        "providers": [
+          "core/callgraph"
+        ],
+        "answered": 0,
+        "inconclusive": 0
+      },
+      {
+        "capability": "reachability",
+        "provided": true,
+        "providers": [
+          "core/analyzers/deps"
+        ],
+        "answered": 0,
+        "inconclusive": 0
+      },
+      {
+        "capability": "attacker_reachability",
+        "provided": true,
+        "providers": [
+          "core/attack"
+        ],
+        "answered": 0,
+        "inconclusive": 0
+      },
+      {
+        "capability": "dynamic_verification",
+        "provided": true,
+        "providers": [
+          "core/attack"
+        ],
+        "answered": 0,
+        "inconclusive": 0
+      }
+    ],
+    "competence_profiles": [
+      {
+        "id": "c1",
+        "subjects": 14,
+        "gaps": [
+          {
+            "capability": "lexical_context",
+            "state": "unsupported",
+            "reason": "unsupported — this analysis cannot apply here"
+          },
+          {
+            "capability": "constant_evaluation",
+            "state": "unsupported",
+            "reason": "unsupported — this analysis cannot apply here"
+          },
+          {
+            "capability": "symbol_resolution",
+            "state": "not_evaluated",
+            "reason": "not evaluated — nothing asked this question"
+          },
+          {
+            "capability": "taint",
+            "state": "not_evaluated",
+            "reason": "not evaluated — nothing asked this question"
+          },
+          {
+            "capability": "call_graph",
+            "state": "unsupported",
+            "reason": "unsupported — this analysis cannot apply here"
+          },
+          {
+            "capability": "entry_point",
+            "state": "unsupported",
+            "reason": "unsupported — this analysis cannot apply here"
+          },
+          {
+            "capability": "reachability",
+            "state": "not_evaluated",
+            "reason": "not evaluated — nothing asked this question"
+          },
+          {
+            "capability": "attacker_reachability",
+            "state": "not_evaluated",
+            "reason": "not evaluated — nothing asked this question"
+          },
+          {
+            "capability": "dynamic_verification",
+            "state": "not_evaluated",
+            "reason": "not evaluated — nothing asked this question"
+          }
+        ]
+      },
+      {
+        "id": "c2",
+        "subjects": 1,
+        "gaps": [
+          {
+            "capability": "lexical_context",
+            "state": "unsupported",
+            "reason": "unsupported — this analysis cannot apply here"
+          },
+          {
+            "capability": "constant_evaluation",
+            "state": "unsupported",
+            "reason": "unsupported — this analysis cannot apply here"
+          },
+          {
+            "capability": "symbol_resolution",
+            "state": "unknown",
+            "reason": "evaluated, and could not determine an answer"
+          },
+          {
+            "capability": "taint",
+            "state": "not_evaluated",
+            "reason": "not evaluated — nothing asked this question"
+          },
+          {
+            "capability": "call_graph",
+            "state": "unsupported",
+            "reason": "unsupported — this analysis cannot apply here"
+          },
+          {
+            "capability": "entry_point",
+            "state": "unsupported",
+            "reason": "unsupported — this analysis cannot apply here"
+          },
+          {
+            "capability": "reachability",
+            "state": "not_evaluated",
+            "reason": "not evaluated — nothing asked this question"
+          },
+          {
+            "capability": "attacker_reachability",
+            "state": "not_evaluated",
+            "reason": "not evaluated — nothing asked this question"
+          },
+          {
+            "capability": "dynamic_verification",
+            "state": "not_evaluated",
+            "reason": "not evaluated — nothing asked this question"
+          }
+        ]
+      }
+    ]
+  },
+  "findings": [
+    {
+      "ID": "IAC-018-bc549bd83bda",
+      "RuleID": "IAC-018",
+      "Severity": "low",
+      "Confidence": "medium",
+      "Location": {
+        "FilePath": ".github/workflows/ci.yml",
+        "StartLine": 82,
+        "EndLine": 82,
+        "StartColumn": 9,
+        "EndColumn": 32
+      },
+      "Message": "Workflow step suppresses failures with continue-on-error",
+      "Fingerprint": "bc549bd83bda47b0f1e5c6cb3fc9d67db65f4fbd72cdd30697bdbc6657d167bb",
+      "Metadata": {
+        "cwe": "CWE-755"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1",
+      "RetiredRuleIDs": [
+        "IAC-310"
+      ],
+      "AliasFingerprints": [
+        "faae53eee5aab123b480b37ae6df3775272ea7eb6546c6b64ee45cf14a19b173"
+      ]
+    },
+    {
+      "ID": "IAC-018-bc549bd83bda",
+      "RuleID": "IAC-018",
+      "Severity": "low",
+      "Confidence": "medium",
+      "Location": {
+        "FilePath": ".github/workflows/ci.yml",
+        "StartLine": 122,
+        "EndLine": 122,
+        "StartColumn": 9,
+        "EndColumn": 32
+      },
+      "Message": "Workflow step suppresses failures with continue-on-error",
+      "Fingerprint": "bc549bd83bda47b0f1e5c6cb3fc9d67db65f4fbd72cdd30697bdbc6657d167bb",
+      "Metadata": {
+        "cwe": "CWE-755"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1",
+      "RetiredRuleIDs": [
+        "IAC-310"
+      ],
+      "AliasFingerprints": [
+        "faae53eee5aab123b480b37ae6df3775272ea7eb6546c6b64ee45cf14a19b173"
+      ]
+    },
+    {
+      "ID": "IAC-018-10d644364312",
+      "RuleID": "IAC-018",
+      "Severity": "low",
+      "Confidence": "medium",
+      "Location": {
+        "FilePath": ".github/workflows/release.yml",
+        "StartLine": 49,
+        "EndLine": 49,
+        "StartColumn": 9,
+        "EndColumn": 32
+      },
+      "Message": "Workflow step suppresses failures with continue-on-error",
+      "Fingerprint": "10d6443643128fe45af051a06ddc6d2db9e72be951abec9329f264df997045dd",
+      "Metadata": {
+        "cwe": "CWE-755"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1",
+      "RetiredRuleIDs": [
+        "IAC-310"
+      ],
+      "AliasFingerprints": [
+        "c60b7cac1b2d2561111a14b679f24958c1b2ace7396cfaf7335d7ea76f56f7ed"
+      ]
+    },
+    {
+      "ID": "IAC-153-0b616c22f622",
+      "RuleID": "IAC-153",
+      "Severity": "medium",
+      "Confidence": "low",
+      "Location": {
+        "FilePath": ".github/workflows/ci.yml",
+        "StartLine": 85,
+        "EndLine": 85,
+        "StartColumn": 15,
+        "EndColumn": 38
+      },
+      "Message": "GitHub Actions artifact upload without attestation",
+      "Fingerprint": "0b616c22f622f9f7c0305ba95cc4a06f162c81308c96e1543e312da993a54363",
+      "Metadata": {
+        "cwe": "CWE-829"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-153-97ad188e0785",
+      "RuleID": "IAC-153",
+      "Severity": "medium",
+      "Confidence": "low",
+      "Location": {
+        "FilePath": ".github/workflows/release.yml",
+        "StartLine": 58,
+        "EndLine": 58,
+        "StartColumn": 15,
+        "EndColumn": 38
+      },
+      "Message": "GitHub Actions artifact upload without attestation",
+      "Fingerprint": "97ad188e0785ddce4eefe6d2d1e10de2c1c850dcab14aa15399d987f5cb53c29",
+      "Metadata": {
+        "cwe": "CWE-829"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-155-efffd45e45bd",
+      "RuleID": "IAC-155",
+      "Severity": "medium",
+      "Confidence": "medium",
+      "Location": {
+        "FilePath": ".github/workflows/nox-remediate.yml",
+        "StartLine": 13,
+        "EndLine": 13,
+        "StartColumn": 1,
+        "EndColumn": 21
+      },
+      "Message": "GitHub Actions manual trigger without environment approval",
+      "Fingerprint": "efffd45e45bdf218052ebd23a0a2fc2295219290f6341d868fed455c871b6993",
+      "Metadata": {
+        "cwe": "CWE-284"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-155-d438f192dd7f",
+      "RuleID": "IAC-155",
+      "Severity": "medium",
+      "Confidence": "medium",
+      "Location": {
+        "FilePath": ".github/workflows/remediation.yml",
+        "StartLine": 6,
+        "EndLine": 6,
+        "StartColumn": 1,
+        "EndColumn": 21
+      },
+      "Message": "GitHub Actions manual trigger without environment approval",
+      "Fingerprint": "d438f192dd7fd961f9e4e00c1e5c4652fc09d3c28c45059ad6197c12dc5b62e0",
+      "Metadata": {
+        "cwe": "CWE-284"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-306-be245a4499fe",
+      "RuleID": "IAC-306",
+      "Severity": "medium",
+      "Confidence": "high",
+      "Location": {
+        "FilePath": ".github/workflows/release.yml",
+        "StartLine": 10,
+        "EndLine": 10,
+        "StartColumn": 3,
+        "EndColumn": 18
+      },
+      "Message": "GHA workflow requests OIDC token write",
+      "Fingerprint": "be245a4499fe01a73e9664baf0ed8c855e243ef4da2b278bd541e113a9dfae2e",
+      "Metadata": {
+        "cwe": "CWE-284"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-308-52922952e40b",
+      "RuleID": "IAC-308",
+      "Severity": "low",
+      "Confidence": "high",
+      "Location": {
+        "FilePath": ".github/workflows/nox-remediate.yml",
+        "StartLine": 13,
+        "EndLine": 13,
+        "StartColumn": 3,
+        "EndColumn": 21
+      },
+      "Message": "GHA manual workflow dispatch enabled",
+      "Fingerprint": "52922952e40b8c5ebd4fef0969dd782d57266e9ecccc4e9bddc9be74f0f6daa2",
+      "Metadata": {
+        "cwe": "CWE-693"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-308-f35c5201086e",
+      "RuleID": "IAC-308",
+      "Severity": "low",
+      "Confidence": "high",
+      "Location": {
+        "FilePath": ".github/workflows/remediation.yml",
+        "StartLine": 6,
+        "EndLine": 6,
+        "StartColumn": 3,
+        "EndColumn": 21
+      },
+      "Message": "GHA manual workflow dispatch enabled",
+      "Fingerprint": "f35c5201086ecb78b7b8c702665b564fdaf9e2c79ecb374aa58ad18a1b7fc1f4",
+      "Metadata": {
+        "cwe": "CWE-693"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-314-8378df7a1d4a",
+      "RuleID": "IAC-314",
+      "Severity": "medium",
+      "Confidence": "medium",
+      "Location": {
+        "FilePath": ".github/workflows/nox-remediate.yml",
+        "StartLine": 16,
+        "EndLine": 16,
+        "StartColumn": 3,
+        "EndColumn": 18
+      },
+      "Message": "GHA workflow has contents write permission",
+      "Fingerprint": "8378df7a1d4adb5806616a668bc89e456b48fe9b7212ca5799b5b8eddbe0ae9c",
+      "Metadata": {
+        "cwe": "CWE-284"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-314-e37e2faa5f7d",
+      "RuleID": "IAC-314",
+      "Severity": "low",
+      "Confidence": "medium",
+      "Location": {
+        "FilePath": ".github/workflows/release.yml",
+        "StartLine": 9,
+        "EndLine": 9,
+        "StartColumn": 3,
+        "EndColumn": 18
+      },
+      "Message": "GHA workflow has contents write permission",
+      "Fingerprint": "e37e2faa5f7d812400d1323a31d22e93b710b881ea06f3b656d724454d47a8f4",
+      "Metadata": {
+        "cwe": "CWE-284",
+        "gha_context": "justified_by_consumer_action",
+        "original_severity": "medium"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-314-5b6d748c035c",
+      "RuleID": "IAC-314",
+      "Severity": "medium",
+      "Confidence": "medium",
+      "Location": {
+        "FilePath": ".github/workflows/remediation.yml",
+        "StartLine": 9,
+        "EndLine": 9,
+        "StartColumn": 3,
+        "EndColumn": 18
+      },
+      "Message": "GHA workflow has contents write permission",
+      "Fingerprint": "5b6d748c035c5374ce8c10e639c69182e502a3c7812cfa38c4bb0639f5dcc076",
+      "Metadata": {
+        "cwe": "CWE-284"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "IAC-315-67d1566bc98d",
+      "RuleID": "IAC-315",
+      "Severity": "low",
+      "Confidence": "medium",
+      "Location": {
+        "FilePath": ".github/workflows/release.yml",
+        "StartLine": 11,
+        "EndLine": 11,
+        "StartColumn": 3,
+        "EndColumn": 18
+      },
+      "Message": "GHA workflow has packages write permission",
+      "Fingerprint": "67d1566bc98dd13ba7ce93f32980089dd18f1516c29d70443f17566e2ea4dea6",
+      "Metadata": {
+        "cwe": "CWE-284",
+        "gha_context": "justified_by_consumer_action",
+        "original_severity": "medium"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c1"
+    },
+    {
+      "ID": "VULN-001-33cfb9c75f0e",
+      "RuleID": "VULN-001",
+      "Severity": "low",
+      "Confidence": "high",
+      "Location": {
+        "FilePath": "go.mod",
+        "StartLine": 1,
+        "EndLine": 1,
+        "StartColumn": 0,
+        "EndColumn": 0
+      },
+      "Message": "Known vulnerability GHSA-8wmf-6v46-5gfg in go.opentelemetry.io/otel/sdk@v1.44.0: OpenTelemetry-Go: Exporter config logging may leak endpoint URLs in info logs — established as far as \"affected_version\"; symbol_used was not established (evaluated, and could not determine an answer)",
+      "Fingerprint": "33cfb9c75f0e85b4786f10c3681245ce7f4a78428c367874d50ca854e3d8379c",
+      "Metadata": {
+        "aliases": "CVE-2026-81870",
+        "applicability": "undetermined",
+        "applicability_because": "unknown",
+        "applicability_reached": "affected_version",
+        "applicability_stopped_at": "symbol_used",
+        "ecosystem": "go",
+        "fixed_in": "1.45.0",
+        "package": "go.opentelemetry.io/otel/sdk",
+        "reach_level": "symbol_referenced",
+        "reach_limitations": "unsupported_framework",
+        "reach_outcome": "undetermined",
+        "reach_scope": "go list -deps, build go build closure; incomplete because a framework's control flow is not modelled",
+        "remediation_action": "upgrade",
+        "remediation_command": "go get go.opentelemetry.io/otel/sdk@v1.45.0",
+        "version": "v1.44.0",
+        "vuln_id": "GHSA-8wmf-6v46-5gfg",
+        "vuln_status": "PUBLISHED"
+      },
+      "Exploitability": "POTENTIAL",
+      "CompetenceProfile": "c2"
+    }
+  ]
+}

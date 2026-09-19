@@ -1,0 +1,1 @@
+plan: go get go.opentelemetry.io/otel/sdk -> 1.45.0  (VULN-001) in .
