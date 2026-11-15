@@ -1,5 +1,7 @@
 # nox-plugin-remediate
 
+[![nox security grade](.github/nox-badge.svg)](https://github.com/nox-hq/nox)
+
 `nox-plugin-remediate` is the remediation orchestration plugin for deterministic code fixes.
 
 Current scope (task-57):

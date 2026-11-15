@@ -1,0 +1,6 @@
+scan:
+  exclude:
+    # Fixtures the plugin's tests assert it detects: vulnerable on purpose,
+    # never built into the plugin. Scanning them grades the test corpus,
+    # not the code that ships.
+    - "testdata/"
